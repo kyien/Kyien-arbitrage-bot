@@ -1,6 +1,6 @@
 from web3 import Web3
-import config
-import json
+from decouple import config
+# import json
 import aiohttp
 import asyncio
 from loguru import logger
@@ -43,6 +43,9 @@ class DexInterface:
             router_address = self.routers[dex_name]
             # Implementation will vary based on DEX
             # This is a simplified example
+            # Fix warning: "async def" function is never awaited
+            await asyncio.sleep(0)
+
             tx = await self._swap_exact_tokens_for_tokens(
                 router_address,
                 amount_in,
@@ -54,6 +57,60 @@ class DexInterface:
         except Exception as e:
             logger.error(f"Error executing swap on {dex_name}: {str(e)}")
             return None
+
+    async def _swap_exact_tokens_for_tokens(self, router_address, amount_in, amount_out_min, path, gas_limit):
+        """
+        Execute a token swap with exact input amount
+        
+        Args:
+            router_address (str): Address of the DEX router contract
+            amount_in (int): Exact amount of input tokens
+            amount_out_min (int): Minimum amount of output tokens to receive
+            path (list): List of token addresses representing the swap path
+            gas_limit (int): Gas limit for the transaction
+            
+        Returns:
+            dict: Transaction receipt
+        """
+        try:
+            # Create contract instance
+            router_abi = config.ROUTER_ABI  # Make sure this is defined in your config
+            router_contract = self.w3.eth.contract(
+                address=router_address,
+                abi=router_abi
+            )
+            
+            # Get deadline (usually current time + some minutes)
+            deadline = self.w3.eth.get_block('latest')['timestamp'] + 300  # 5 minutes
+            
+            # Build the swap transaction
+            swap_txn = router_contract.functions.swapExactTokensForTokens(
+                amount_in,
+                amount_out_min,
+                path,
+                config.WALLET_ADDRESS,  # Make sure this is defined in your config
+                deadline
+            ).build_transaction({
+                'from': config.WALLET_ADDRESS,
+                'gas': gas_limit,
+                'gasPrice': self.w3.eth.gas_price,
+                'nonce': self.w3.eth.get_transaction_count(config.WALLET_ADDRESS),
+            })
+            
+            # Sign and send the transaction
+            signed_txn = self.w3.eth.account.sign_transaction(
+                swap_txn,
+                config.PRIVATE_KEY  # Make sure this is defined in your config
+            )
+            tx_hash = await self.w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+            
+            # Wait for transaction receipt
+            tx_receipt = await self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            return tx_receipt
+            
+        except Exception as e:
+            logger.error(f"Error in _swap_exact_tokens_for_tokens: {str(e)}")
+            raise
 
     async def monitor_dex_prices(self):
         """Monitor DEX prices using websocket"""

@@ -6,6 +6,7 @@ import config
 import asyncio
 from typing import Dict, Any, List, Optional
 import time
+from mev_protection import mev_protection, gas_optimizer
 
 class ContractInterface:
     def __init__(self):
@@ -106,8 +107,45 @@ class ContractInterface:
                 logger.error(f"Router address not found for {router_type} on {chain}")
                 return None
             
-            # Prepare the transaction
-            deadline = int(time.time()) + 300  # 5 minutes from now
+            # Prepare the transaction with optimized parameters
+            deadline = gas_optimizer.calculate_optimal_deadline(w3)
+            
+            # Get optimized gas price with MEV protection
+            urgency = 'high' if min_amount_out > 0 else 'normal'
+            gas_price_params = mev_protection.calculate_optimal_gas_price(w3, chain, urgency)
+            
+            # Get optimized gas limit
+            tx_params = {
+                'from': self.account_address,
+                'nonce': w3.eth.get_transaction_count(self.account_address),
+                'chainId': w3.eth.chain_id,
+                **gas_price_params
+            }
+            
+            gas_limit = gas_optimizer.get_optimized_gas_limit(
+                w3,
+                contract.functions.executeSwap,
+                {
+                    'router_address': router_address,
+                    'token_in': token_in,
+                    'token_out': token_out,
+                    'amount_in': amount_in,
+                    'min_amount_out': min_amount_out,
+                    'deadline': deadline
+                }
+            )
+            
+            # Optimize gas price based on expected profit (before building transaction)
+            # Estimate profit (this should be calculated earlier)
+            estimated_profit = (min_amount_out - amount_in) / 1e18  # Rough estimate
+            gas_price_params = gas_optimizer.optimize_gas_price_for_profit(
+                gas_price_params,
+                estimated_profit * 2000,  # Convert to USD (rough estimate)
+                gas_limit
+            )
+            
+            # Update tx_params with optimized gas price
+            tx_params.update(gas_price_params)
             
             # Build the transaction
             tx = contract.functions.executeSwap(
@@ -118,26 +156,36 @@ class ContractInterface:
                 min_amount_out,
                 deadline
             ).build_transaction({
-                'from': self.account_address,
-                'nonce': w3.eth.get_transaction_count(self.account_address),
-                'gas': config.GAS_LIMIT,
-                'gasPrice': self._get_optimal_gas_price(w3),
-                'chainId': w3.eth.chain_id
+                **tx_params,
+                'gas': gas_limit
             })
+            
+            # Add timing randomization to avoid MEV
+            delay = mev_protection.add_timing_randomization(chain)
+            await asyncio.sleep(delay)
             
             # Sign the transaction
             signed_tx = w3.eth.account.sign_transaction(tx, self.private_key)
             
-            # Add anti-MEV protection
-            protected_tx = self._apply_anti_mev_protection(chain, signed_tx)
+            # Check if we should use private transaction pool
+            use_private = mev_protection.should_use_private_pool(chain, estimated_profit * 2000)
             
             # Send the transaction
-            tx_hash = w3.eth.send_raw_transaction(protected_tx.rawTransaction)
+            if use_private and chain.lower() in ['ethereum', 'mainnet']:
+                # For Ethereum, could use Flashbots here
+                # For now, just send normally but log the recommendation
+                logger.info(f"High-value transaction detected, consider using Flashbots for {chain}")
+            
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
             
             # Wait for transaction confirmation
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
             
-            if receipt.status == 1:
+            # Record transaction for MEV protection analysis
+            success = receipt.status == 1
+            mev_protection.record_transaction(chain, success)
+            
+            if success:
                 logger.info(f"Swap executed successfully on {chain}: {w3.to_hex(tx_hash)}")
                 return w3.to_hex(tx_hash)
             else:
@@ -234,7 +282,7 @@ class ContractInterface:
         
         return routers.get(chain, {}).get(router_type.lower())
     
-    def _get_optimal_gas_price(self, w3: Web3) -> int:
+    def _get_optimal_gas_price_legacy(self, w3: Web3) -> int:
         """Get optimal gas price with anti-MEV considerations"""
         try:
             # Get current gas price

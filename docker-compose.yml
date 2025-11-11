@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  arbitrage-bot:
+    build: .
+    container_name: crypto-arbitrage-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./deployed_contracts.json:/app/deployed_contracts.json
+    networks:
+      - arbitrage-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  arbitrage-network:
+    driver: bridge
+

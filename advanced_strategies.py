@@ -169,10 +169,13 @@ class AdvancedStrategyManager:
         """Convert trend to a numeric score"""
         return {"bullish": 1.0, "sideways": 0.5, "bearish": 0.0}.get(trend, 0.5)
 
-    def _normalize_volume(self, volume: float) -> float:
+    def _normalize_volume(self, volume: float, symbol: str = None) -> float:
         """Normalize volume to a score between 0 and 1"""
         # Compare to moving average
-        return min(1.0, volume / np.mean(self.volume_history.get(symbol, [volume])))
+        if symbol and symbol in self.volume_history:
+            historical_avg = np.mean(self.volume_history[symbol])
+            return min(1.0, volume / historical_avg) if historical_avg > 0 else 1.0
+        return min(1.0, volume / max(volume, 1))  # Fallback if no history
 
     def _normalize_liquidity(self, liquidity: float) -> float:
         """Normalize liquidity to a score between 0 and 1"""
