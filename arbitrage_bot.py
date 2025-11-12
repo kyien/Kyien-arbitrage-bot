@@ -142,73 +142,59 @@ class ArbitrageBot:
         return mas
 
     async def check_dex_arbitrage(self):
-        """Check for arbitrage opportunities between DEXes using smart contracts"""
+        """Check for arbitrage opportunities between DEXes using parallel queries"""
         while self.running:
             try:
                 for pair in config.TRADING_PAIRS['DEX']:
                     token_in, token_out = pair.split('/')
-                    
-                    # Get prices from different DEXes
-                    prices = {}
-                    volumes = {}
-                    liquidity = {}
-                    
-                    for dex in ['quickswap', 'sushiswap', 'uniswap_v3']:
-                        price = await self.dex.get_token_price(dex, 
-                                                             config.TOKENS[token_in],
-                                                             config.TOKENS[token_out])
-                        if price:
-                            prices[dex] = price
-                            
-                            # Get additional market data for strategy analysis
-                            volume = await self.dex.get_volume(dex, pair)
-                            liquidity_depth = await self.dex.check_liquidity(dex, pair)
-                            
-                            volumes[dex] = volume
-                            liquidity[dex] = liquidity_depth
-                    
-                    # Find arbitrage opportunities
-                    for dex1 in prices:
-                        for dex2 in prices:
-                            if dex1 != dex2:
-                                profit = (prices[dex2] - prices[dex1]) / prices[dex1] * 100
-                                
-                                if profit > config.MIN_PROFIT_THRESHOLD:
-                                    # Analyze market conditions using advanced strategies
-                                    market_condition = self.strategy.analyze_market_conditions(
-                                        pair,
-                                        list(prices.values()),
-                                        list(volumes.values()),
-                                        list(liquidity.values())
-                                    )
-                                    
-                                    # Determine if we should execute the trade
-                                    should_execute, reason = self.strategy.should_execute_trade(
-                                        market_condition,
-                                        profit
-                                    )
-                                    
-                                    if should_execute:
-                                        # Calculate optimal position size
-                                        optimal_amount = self.strategy.calculate_optimal_position_size(
-                                            market_condition,
-                                            config.MAX_POSITION_SIZE
-                                        )
-                                        
-                                        # Execute arbitrage using flashswap instead of flashloan
-                                        await self.execute_dex_flashswap(
-                                            'polygon',  # The chain to execute on
-                                            dex1,
-                                            dex2,
-                                            token_in,
-                                            token_out,
-                                            optimal_amount,
-                                            prices
-                                        )
-                                    else:
-                                        logger.info(f"Skipping opportunity due to market conditions: {reason}")
-                
-                await asyncio.sleep(0.1)  # Small delay to prevent CPU overload
+
+                    # Get prices from all DEXes in parallel
+                    dex_names = ['quickswap', 'sushiswap', 'uniswap_v3']
+
+                    # Create all tasks at once for parallel execution
+                    price_tasks = [
+                        self.dex.get_token_price(
+                            dex,
+                            config.TOKENS[token_in],
+                            config.TOKENS[token_out]
+                        ) for dex in dex_names
+                    ]
+
+                    volume_tasks = [
+                        self.dex.get_volume(dex, pair) for dex in dex_names
+                    ]
+
+                    liquidity_tasks = [
+                        self.dex.check_liquidity(dex, pair) for dex in dex_names
+                    ]
+
+                    # Execute all queries in parallel using asyncio.gather
+                    results = await asyncio.gather(
+                        *price_tasks,
+                        *volume_tasks,
+                        *liquidity_tasks,
+                        return_exceptions=True
+                    )
+
+                    # Parse results
+                    num_dexs = len(dex_names)
+                    prices = dict(zip(dex_names, results[:num_dexs]))
+                    volumes = dict(zip(dex_names, results[num_dexs:num_dexs*2]))
+                    liquidity = dict(zip(dex_names, results[num_dexs*2:]))
+
+                    # Filter out None values and exceptions (failed queries)
+                    prices = {k: v for k, v in prices.items() if v is not None and not isinstance(v, Exception)}
+                    volumes = {k: v for k, v in volumes.items() if v is not None and not isinstance(v, Exception)}
+                    liquidity = {k: v for k, v in liquidity.items() if v is not None and not isinstance(v, Exception)}
+
+                    # Process arbitrage opportunities
+                    await self._process_arbitrage_opportunities(
+                        pair, token_in, token_out, prices, volumes, liquidity
+                    )
+
+                # CRITICAL: Reduce sleep time dramatically for faster opportunity detection
+                await asyncio.sleep(0.01)  # 10ms instead of 100ms = 10x faster
+
             except Exception as e:
                 logger.error(f"Error in DEX arbitrage check: {str(e)}")
                 await self.monitoring.log_error({
@@ -216,6 +202,74 @@ class ArbitrageBot:
                     "error": str(e)
                 })
                 await asyncio.sleep(1)
+
+    async def _process_arbitrage_opportunities(self, pair, token_in, token_out, prices, volumes, liquidity):
+        """Process arbitrage opportunities for a given pair"""
+        # Find best opportunities
+        for dex1 in prices:
+            for dex2 in prices:
+                if dex1 != dex2:
+                    # Calculate profit percentage
+                    profit_pct = (prices[dex2] - prices[dex1]) / prices[dex1] * 100
+
+                    if profit_pct > config.MIN_PROFIT_THRESHOLD:
+                        # Check if liquidity is sufficient
+                        if liquidity.get(dex1, 0) < config.MIN_LIQUIDITY_THRESHOLD:
+                            logger.debug(f"Insufficient liquidity on {dex1} for {pair}")
+                            continue
+
+                        # Analyze market conditions
+                        market_condition = self.strategy.analyze_market_conditions(
+                            pair,
+                            list(prices.values()),
+                            list(volumes.values()),
+                            list(liquidity.values())
+                        )
+
+                        if not market_condition:
+                            logger.debug(f"Could not analyze market conditions for {pair}")
+                            continue
+
+                        # Determine if we should execute the trade
+                        should_execute, reason = self.strategy.should_execute_trade(
+                            market_condition,
+                            profit_pct
+                        )
+
+                        if should_execute:
+                            # Calculate optimal position size
+                            optimal_amount = self.strategy.calculate_optimal_position_size(
+                                market_condition,
+                                config.MAX_POSITION_SIZE
+                            )
+
+                            # Simulate trade first to verify profitability
+                            is_profitable = await self._simulate_and_verify_trade(
+                                'polygon',
+                                dex1,
+                                dex2,
+                                token_in,
+                                token_out,
+                                optimal_amount,
+                                prices,
+                                profit_pct
+                            )
+
+                            if is_profitable:
+                                # Execute arbitrage using flashswap with retry logic
+                                await self.execute_dex_flashswap_with_retry(
+                                    'polygon',
+                                    dex1,
+                                    dex2,
+                                    token_in,
+                                    token_out,
+                                    optimal_amount,
+                                    prices
+                                )
+                            else:
+                                logger.debug(f"Trade not profitable after gas costs for {pair}")
+                        else:
+                            logger.debug(f"Skipping {pair} opportunity: {reason}")
 
     async def execute_dex_flashswap(self, chain, dex1, dex2, token_in, token_out, amount, prices):
         """Execute arbitrage between DEXes using flashswap"""
@@ -501,6 +555,155 @@ class ArbitrageBot:
         except Exception as e:
             logger.error(f"Error in market monitoring: {str(e)}")
             await asyncio.sleep(5)
+
+    async def _simulate_and_verify_trade(self, chain, dex1, dex2, token_in, token_out,
+                                         amount, prices, profit_pct) -> bool:
+        """Simulate trade execution and verify profitability after gas costs"""
+        try:
+            w3 = self.w3
+
+            # Get token addresses
+            token_in_address = config.TOKENS[token_in]
+            token_out_address = config.TOKENS[token_out]
+
+            # Get pair address for flashswap
+            pair_address = await self.dex.get_pair_address(
+                dex1, token_in_address, token_out_address
+            )
+
+            if not pair_address:
+                logger.debug(f"No pair found for {token_in}/{token_out} on {dex1}")
+                return False
+
+            # Get the arbitrage contract
+            contract = self.contract_interface.contracts.get(chain, {}).get('arbitrage_executor')
+            if not contract:
+                logger.error("Arbitrage contract not deployed")
+                return False
+
+            # Encode callback data
+            target_router = self.dex.routers[dex2]
+            callback_data = w3.codec.encode_abi(
+                ['address', 'address', 'address'],
+                [target_router, token_in_address, token_out_address]
+            )
+
+            # Simulate the transaction using eth_call
+            try:
+                amount_wei = Web3.to_wei(amount, 'ether')
+
+                # Try to call the function to see if it would succeed
+                await asyncio.to_thread(
+                    contract.functions.executeFlashSwap(
+                        pair_address,
+                        token_in_address,
+                        amount_wei,
+                        callback_data
+                    ).call,
+                    {'from': config.WALLET_ADDRESS}
+                )
+
+                logger.info(f"✓ Trade simulation successful for {token_in}/{token_out}")
+
+            except Exception as sim_error:
+                logger.warning(f"✗ Trade simulation failed for {token_in}/{token_out}: {str(sim_error)}")
+                return False
+
+            # Estimate gas cost
+            try:
+                gas_estimate = await asyncio.to_thread(
+                    contract.functions.executeFlashSwap(
+                        pair_address,
+                        token_in_address,
+                        amount_wei,
+                        callback_data
+                    ).estimate_gas,
+                    {'from': config.WALLET_ADDRESS}
+                )
+
+                # Get gas price
+                gas_price = w3.eth.gas_price
+                gas_cost_wei = gas_estimate * gas_price
+                gas_cost_eth = Web3.from_wei(gas_cost_wei, 'ether')
+
+                # Estimate gas cost in USD (assuming MATIC price ~ $0.80)
+                gas_cost_usd = float(gas_cost_eth) * 0.80
+
+                # Calculate expected profit
+                profit_usd = amount * (profit_pct / 100)
+
+                # Verify profitability after gas
+                net_profit = profit_usd - gas_cost_usd
+
+                if net_profit > config.MIN_PROFIT_THRESHOLD:
+                    logger.info(
+                        f"✓ Trade profitable: ${net_profit:.2f} "
+                        f"(Gross: ${profit_usd:.2f}, Gas: ${gas_cost_usd:.2f})"
+                    )
+                    return True
+                else:
+                    logger.debug(
+                        f"✗ Trade unprofitable after gas: ${net_profit:.2f} "
+                        f"(Gas: ${gas_cost_usd:.2f} exceeds profit: ${profit_usd:.2f})"
+                    )
+                    return False
+
+            except Exception as gas_error:
+                logger.error(f"Error estimating gas: {str(gas_error)}")
+                # If we can't estimate gas, be conservative and skip
+                return False
+
+        except Exception as e:
+            logger.error(f"Error simulating trade: {str(e)}")
+            return False
+
+    async def execute_dex_flashswap_with_retry(self, chain, dex1, dex2, token_in,
+                                               token_out, amount, prices, max_retries=3):
+        """Execute flashswap with retry logic and circuit breaker protection"""
+        for attempt in range(max_retries):
+            try:
+                # Check circuit breaker before attempting
+                from circuit_breaker import risk_manager
+
+                if not risk_manager.check_trade_allowed(chain):
+                    logger.warning(f"Trade blocked by risk manager for {chain}")
+                    return None
+
+                result = await self.execute_dex_flashswap(
+                    chain, dex1, dex2, token_in, token_out, amount, prices
+                )
+
+                if result:
+                    # Record success
+                    profit_estimate = amount * ((prices[dex2] - prices[dex1]) / prices[dex1])
+                    risk_manager.record_trade_result(chain, profit_estimate, True)
+
+                    logger.info(f"✓ Flashswap executed successfully on attempt {attempt + 1}")
+                    return result
+                else:
+                    # Record failure
+                    risk_manager.record_trade_result(chain, 0, False)
+
+                    if attempt < max_retries - 1:
+                        # Exponential backoff
+                        wait_time = (2 ** attempt) * 0.1  # 0.1s, 0.2s, 0.4s
+                        logger.info(f"Retry attempt {attempt + 2} after {wait_time}s")
+                        await asyncio.sleep(wait_time)
+
+            except Exception as e:
+                logger.error(f"Error on attempt {attempt + 1}: {str(e)}")
+
+                # Record failure
+                from circuit_breaker import risk_manager
+                risk_manager.record_trade_result(chain, 0, False)
+
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 0.1
+                    logger.info(f"Waiting {wait_time}s before retry")
+                    await asyncio.sleep(wait_time)
+
+        logger.error(f"All {max_retries} retry attempts failed for {chain}")
+        return None
 
     async def start(self):
         """Start the arbitrage bot"""

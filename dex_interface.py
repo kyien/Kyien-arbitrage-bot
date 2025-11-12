@@ -16,26 +16,50 @@ class DexInterface:
             'uniswap_v3': config.UNISWAP_V3_ROUTER
         }
         
-    async def get_token_price(self, dex_name, token_address, base_token_address):
-        """Get token price from DEX"""
-        router_address = self.routers[dex_name]
-        # Implementation will vary based on DEX (Uniswap V2 vs V3)
-        # This is a simplified example
+    async def get_token_price(self, dex_name, token_address, base_token_address, amount_in=None):
+        """Get actual token price from DEX router"""
         try:
-            # Call router contract to get price
-            return await self._get_amount_out(
-                router_address,
-                Web3.to_wei(1, 'ether'),
-                [token_address, base_token_address]
+            if amount_in is None:
+                amount_in = Web3.to_wei(1, 'ether')
+
+            router_address = self.routers[dex_name]
+            router_contract = self.w3.eth.contract(
+                address=router_address,
+                abi=config.ROUTER_ABI
             )
+
+            path = [token_address, base_token_address]
+
+            # Get amounts out from router using asyncio.to_thread for non-blocking calls
+            amounts = await asyncio.to_thread(
+                router_contract.functions.getAmountsOut(amount_in, path).call
+            )
+
+            # Return the output amount (last element)
+            return amounts[-1] if amounts else None
+
         except Exception as e:
             logger.error(f"Error getting price from {dex_name}: {str(e)}")
             return None
 
     async def _get_amount_out(self, router_address, amount_in, path):
         """Get amount out for a given amount in and path"""
-        # Implementation will depend on the specific DEX router contract
-        pass
+        try:
+            router_contract = self.w3.eth.contract(
+                address=router_address,
+                abi=config.ROUTER_ABI
+            )
+
+            # Use asyncio.to_thread to avoid blocking
+            amounts = await asyncio.to_thread(
+                router_contract.functions.getAmountsOut(amount_in, path).call
+            )
+
+            return amounts[-1] if amounts else None
+
+        except Exception as e:
+            logger.error(f"Error in _get_amount_out: {str(e)}")
+            return None
 
     async def execute_swap(self, dex_name, token_in, token_out, amount_in):
         """Execute a swap on the specified DEX"""
@@ -144,11 +168,152 @@ class DexInterface:
         return price_impact
 
     async def check_liquidity(self, dex_name, token_pair):
-        """Check liquidity for a token pair on a DEX"""
+        """Check actual liquidity from pair contract"""
         try:
-            # Implementation will vary based on DEX
-            # Return liquidity in USDT equivalent
-            pass
+            token_in, token_out = token_pair.split('/')
+            token_in_addr = config.TOKENS.get(token_in)
+            token_out_addr = config.TOKENS.get(token_out)
+
+            if not token_in_addr or not token_out_addr:
+                logger.warning(f"Token addresses not found for {token_pair}")
+                return 0
+
+            # Get pair address
+            factory_address = self._get_factory_address(dex_name)
+            if not factory_address:
+                return 0
+
+            factory_abi = [
+                {
+                    "constant": True,
+                    "inputs": [
+                        {"name": "tokenA", "type": "address"},
+                        {"name": "tokenB", "type": "address"}
+                    ],
+                    "name": "getPair",
+                    "outputs": [{"name": "pair", "type": "address"}],
+                    "type": "function"
+                }
+            ]
+
+            factory = self.w3.eth.contract(address=factory_address, abi=factory_abi)
+            pair_address = await asyncio.to_thread(
+                factory.functions.getPair(token_in_addr, token_out_addr).call
+            )
+
+            if pair_address == '0x0000000000000000000000000000000000000000':
+                logger.debug(f"No pair found for {token_pair} on {dex_name}")
+                return 0
+
+            # Get reserves from pair
+            pair_abi = [
+                {
+                    "constant": True,
+                    "inputs": [],
+                    "name": "getReserves",
+                    "outputs": [
+                        {"name": "reserve0", "type": "uint112"},
+                        {"name": "reserve1", "type": "uint112"},
+                        {"name": "blockTimestampLast", "type": "uint32"}
+                    ],
+                    "type": "function"
+                },
+                {
+                    "constant": True,
+                    "inputs": [],
+                    "name": "token0",
+                    "outputs": [{"name": "", "type": "address"}],
+                    "type": "function"
+                },
+                {
+                    "constant": True,
+                    "inputs": [],
+                    "name": "token1",
+                    "outputs": [{"name": "", "type": "address"}],
+                    "type": "function"
+                }
+            ]
+
+            pair_contract = self.w3.eth.contract(address=pair_address, abi=pair_abi)
+            reserves = await asyncio.to_thread(pair_contract.functions.getReserves().call)
+
+            # Calculate liquidity in USD (simplified - assumes USDC/USDT as one of the tokens)
+            reserve0, reserve1, _ = reserves
+
+            # Get token0 and token1 to determine which reserve is which
+            token0 = await asyncio.to_thread(pair_contract.functions.token0().call)
+
+            # Determine which reserve corresponds to the stablecoin
+            if token0.lower() == token_in_addr.lower():
+                # Check if token_out is a stablecoin
+                if token_out in ['USDC', 'USDT']:
+                    liquidity_usd = reserve1 / 1e6  # Assuming 6 decimals for stablecoins
+                else:
+                    liquidity_usd = reserve0 / 1e18  # Assuming 18 decimals
+            else:
+                if token_in in ['USDC', 'USDT']:
+                    liquidity_usd = reserve0 / 1e6
+                else:
+                    liquidity_usd = reserve1 / 1e18
+
+            return liquidity_usd * 2  # Total liquidity is both reserves
+
         except Exception as e:
             logger.error(f"Error checking liquidity on {dex_name}: {str(e)}")
             return 0
+
+    def _get_factory_address(self, dex_name):
+        """Get factory address for DEX"""
+        factories = {
+            'quickswap': '0x5757371414417b8C6CAad45bAeF941aBc7d3Ab32',
+            'sushiswap': '0xc35DADB65012eC5796536bD9864eD8773aBc74C4',
+            'uniswap_v3': '0x1F98431c8aD98523631AE4a59f267346ea31F984'
+        }
+        return factories.get(dex_name)
+
+    async def get_volume(self, dex_name, token_pair):
+        """Get 24h trading volume (simplified implementation)"""
+        try:
+            # For production: integrate with TheGraph API or on-chain events
+            # For now, estimate based on liquidity
+            liquidity = await self.check_liquidity(dex_name, token_pair)
+            # Rough estimate: daily volume is typically 0.5-2x liquidity
+            estimated_volume = liquidity * 1.0
+            return estimated_volume
+        except Exception as e:
+            logger.error(f"Error getting volume from {dex_name}: {str(e)}")
+            return 100000  # Default fallback
+
+    async def get_pair_address(self, dex_name, token_in_address, token_out_address):
+        """Get pair address for two tokens on a DEX"""
+        try:
+            factory_address = self._get_factory_address(dex_name)
+            if not factory_address:
+                return None
+
+            factory_abi = [
+                {
+                    "constant": True,
+                    "inputs": [
+                        {"name": "tokenA", "type": "address"},
+                        {"name": "tokenB", "type": "address"}
+                    ],
+                    "name": "getPair",
+                    "outputs": [{"name": "pair", "type": "address"}],
+                    "type": "function"
+                }
+            ]
+
+            factory = self.w3.eth.contract(address=factory_address, abi=factory_abi)
+            pair_address = await asyncio.to_thread(
+                factory.functions.getPair(token_in_address, token_out_address).call
+            )
+
+            if pair_address == '0x0000000000000000000000000000000000000000':
+                return None
+
+            return pair_address
+
+        except Exception as e:
+            logger.error(f"Error getting pair address: {str(e)}")
+            return None
