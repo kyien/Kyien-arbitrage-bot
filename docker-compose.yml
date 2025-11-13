@@ -1,32 +1,92 @@
 version: '3.8'
 
 services:
+  # Main arbitrage bot service
   arbitrage-bot:
-    build: .
-    container_name: crypto-arbitrage-bot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arbitrage-bot
     restart: unless-stopped
+
+    # Environment variables (use .env file)
     env_file:
       - .env
-    volumes:
-      - ./logs:/app/logs
-      - ./deployed_contracts.json:/app/deployed_contracts.json
-    networks:
-      - arbitrage-network
+
+    # Resource limits for 8GB RAM VPS
+    # Bot gets 4GB RAM, 1.5 CPUs (leaving resources for n8n and system)
     deploy:
       resources:
         limits:
-          memory: 2G
-          cpus: '2.0'
+          cpus: '1.5'
+          memory: 4G
         reservations:
-          memory: 512M
           cpus: '0.5'
+          memory: 1G
+
+    # Volumes for persistent data
+    volumes:
+      # Logs directory (persistent)
+      - ./logs:/var/log/arbitrage-bot
+
+      # Configuration files (read-only)
+      - ./config.py:/app/config.py:ro
+      - ./.env:/app/.env:ro
+
+      # Deployment data (persistent)
+      - ./deployed_contracts_v2.json:/app/deployed_contracts_v2.json
+      - ./deployed_contracts_v2_polygon_abi.json:/app/deployed_contracts_v2_polygon_abi.json
+      - ./deployed_contracts_v2_arbitrum_abi.json:/app/deployed_contracts_v2_arbitrum_abi.json
+      - ./deployed_contracts_v2_optimism_abi.json:/app/deployed_contracts_v2_optimism_abi.json
+      - ./deployed_contracts_v2_bsc_abi.json:/app/deployed_contracts_v2_bsc_abi.json
+
+    # Network configuration
+    networks:
+      - arbitrage-network
+
+    # Logging configuration (10MB max size, keep 3 files)
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
 
+    # Health check (every 60 seconds)
+    healthcheck:
+      test: ["CMD", "python", "scripts/health_check.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    # Labels for management
+    labels:
+      - "com.arbitrage-bot.service=main"
+      - "com.arbitrage-bot.version=2.0.0"
+
+  # Optional: Monitoring dashboard (Prometheus metrics exporter)
+  # Uncomment if you want metrics monitoring
+  # prometheus-exporter:
+  #   image: prom/node-exporter:latest
+  #   container_name: arbitrage-metrics
+  #   restart: unless-stopped
+  #   command:
+  #     - '--path.rootfs=/host'
+  #   volumes:
+  #     - /:/host:ro,rslave
+  #   networks:
+  #     - arbitrage-network
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: '0.2'
+  #         memory: 128M
+
 networks:
+  # Shared network with n8n (if needed)
   arbitrage-network:
     driver: bridge
+    # If you want to connect to existing n8n network, uncomment below:
+    # external: true
+    # name: n8n_network
 

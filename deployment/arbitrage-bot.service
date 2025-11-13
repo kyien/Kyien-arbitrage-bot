@@ -1,0 +1,115 @@
+# Systemd service file for Arbitrage Bot
+# Provides auto-restart on failure
+#
+# Installation:
+# 1. Copy this file to /etc/systemd/system/
+#    sudo cp deployment/arbitrage-bot.service /etc/systemd/system/
+#
+# 2. Reload systemd
+#    sudo systemctl daemon-reload
+#
+# 3. Enable service (start on boot)
+#    sudo systemctl enable arbitrage-bot
+#
+# 4. Start service
+#    sudo systemctl start arbitrage-bot
+#
+# Management:
+# - Check status: sudo systemctl status arbitrage-bot
+# - View logs: sudo journalctl -u arbitrage-bot -f
+# - Restart: sudo systemctl restart arbitrage-bot
+# - Stop: sudo systemctl stop arbitrage-bot
+# - Disable: sudo systemctl disable arbitrage-bot
+
+[Unit]
+Description=Multi-Chain DEX Arbitrage Bot with MEV Protection
+Documentation=https://github.com/yourusername/arbitrage-bot
+After=network-online.target
+Wants=network-online.target
+# If using Docker, wait for Docker to start
+# After=docker.service
+# Requires=docker.service
+
+[Service]
+Type=simple
+
+# User and group (create arbitrage-bot user first)
+# sudo useradd -r -s /bin/false arbitrage-bot
+User=arbitrage-bot
+Group=arbitrage-bot
+
+# Working directory
+WorkingDirectory=/opt/arbitrage-bot
+
+# Environment file
+EnvironmentFile=/opt/arbitrage-bot/.env
+
+# Command to execute
+ExecStart=/usr/bin/python3 /opt/arbitrage-bot/multi_chain_bot.py
+
+# Alternative: Run with Docker Compose
+# ExecStart=/usr/bin/docker-compose -f /opt/arbitrage-bot/docker-compose.yml up
+# ExecStop=/usr/bin/docker-compose -f /opt/arbitrage-bot/docker-compose.yml down
+
+# Pre-start script (optional: check prerequisites)
+ExecStartPre=/usr/bin/python3 /opt/arbitrage-bot/scripts/health_check.py
+
+# Post-stop script (optional: cleanup)
+# ExecStopPost=/usr/bin/python3 /opt/arbitrage-bot/scripts/cleanup.py
+
+# Restart configuration
+Restart=always
+RestartSec=10s
+
+# Advanced restart settings
+StartLimitInterval=5min
+StartLimitBurst=4
+
+# If service fails 4 times in 5 minutes, wait 30 seconds before trying again
+# This prevents rapid restart loops
+
+# Resource limits (for 8GB RAM VPS)
+MemoryMax=4G
+MemoryHigh=3G
+CPUQuota=150%
+
+# Nice level (lower = higher priority, range: -20 to 19)
+Nice=-5
+
+# IO priority (best-effort, range: 0-7, lower = higher priority)
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arbitrage-bot
+
+# Log level
+# Environment="LOG_LEVEL=INFO"
+
+# Security settings
+# Prevent access to parts of the filesystem
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/arbitrage-bot /opt/arbitrage-bot
+
+# Prevent privilege escalation
+NoNewPrivileges=true
+
+# Private /tmp
+PrivateTmp=true
+
+# Restrict network access (allow all for RPC connections)
+# RestrictAddressFamilies=AF_INET AF_INET6
+
+# Process termination
+TimeoutStopSec=30s
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Watchdog (optional: restart if no keepalive for 2 minutes)
+WatchdogSec=120s
+
+[Install]
+WantedBy=multi-user.target

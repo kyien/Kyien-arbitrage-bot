@@ -10,50 +10,82 @@ import json
 import numpy as np
 from dex_interface import DexInterface
 from flashloan import FlashloanExecutor
-from contract_interface import ContractInterface
+from contract_interface_v2 import ContractInterfaceV2
 from cross_chain import CrossChainManager
 from advanced_strategies import AdvancedStrategyManager
-from monitoring import MonitoringSystem
+from monitoring_alerts import alert_manager
+from logging_config import setup_logging, log_trade, log_performance
+from scripts.health_check import update_heartbeat
 
 class ArbitrageBot:
-    def __init__(self):
-        # Initialize CEX exchanges
-        self.binance = ccxt.binance({
-            'apiKey': config.BINANCE_API_KEY,
-            'secret': config.BINANCE_SECRET_KEY,
-            'enableRateLimit': True
-        })
-        
-        self.okx = ccxt.okx({
-            'apiKey': config.OKX_API_KEY,
-            'secret': config.OKX_SECRET_KEY,
-            'enableRateLimit': True
-        })
-        
-        # Initialize Web3 and DEX interfaces
-        self.w3 = Web3(Web3.HTTPProvider(config.POLYGON_RPC_URL))
-        self.dex = DexInterface(config.POLYGON_RPC_URL)
-        self.flashloan = FlashloanExecutor(config.POLYGON_RPC_URL)
-        
+    def __init__(self, chain='polygon', enable_cex=False):
+        """
+        Initialize Arbitrage Bot for a specific chain
+
+        Args:
+            chain: Chain to operate on ('polygon', 'arbitrum', 'optimism', 'bsc', 'ethereum')
+            enable_cex: Whether to enable CEX trading (requires API keys and capital)
+        """
+        self.chain = chain
+        self.enable_cex = enable_cex
+
+        # Get chain configuration
+        chain_config = config.SUPPORTED_CHAINS.get(chain)
+        if not chain_config:
+            raise ValueError(f"Unsupported chain: {chain}")
+
+        # Initialize CEX exchanges (only if enabled)
+        if enable_cex:
+            self.binance = ccxt.binance({
+                'apiKey': config.BINANCE_API_KEY,
+                'secret': config.BINANCE_SECRET_KEY,
+                'enableRateLimit': True
+            })
+
+            self.okx = ccxt.okx({
+                'apiKey': config.OKX_API_KEY,
+                'secret': config.OKX_SECRET_KEY,
+                'enableRateLimit': True
+            })
+        else:
+            self.binance = None
+            self.okx = None
+
+        # Get RPC URL for this chain
+        rpc_url = chain_config['rpc']
+
+        # Initialize Web3 and DEX interfaces for this chain
+        self.w3 = Web3(Web3.HTTPProvider(rpc_url))
+        self.dex = DexInterface(rpc_url, chain=chain)
+        self.flashloan = FlashloanExecutor(rpc_url)
+
         # Initialize new components
-        self.contract_interface = ContractInterface()
+        # Note: ContractInterfaceV2 requires deployed contracts - initialize when needed
+        self.contract_interface = None  # Will be initialized with chain parameter
         self.cross_chain = CrossChainManager()
         self.strategy = AdvancedStrategyManager()
-        self.monitoring = MonitoringSystem()
-        
-        # Price storage
-        self.prices = {
-            'binance': {},
-            'okx': {},
-            'quickswap': {},
-            'sushiswap': {},
-            'uniswap_v3': {}
-        }
-        
+        # Monitoring is now handled by alert_manager (imported globally)
+
+        # Get DEX names for this chain
+        self.dex_names = list(config.DEX_ROUTERS.get(chain, {}).keys())
+
+        # Get tokens for this chain
+        self.tokens = config.TOKENS_BY_CHAIN.get(chain, {})
+
+        # Price storage (dynamically create based on available DEXes)
+        self.prices = {dex: {} for dex in self.dex_names}
+        if enable_cex:
+            self.prices['binance'] = {}
+            self.prices['okx'] = {}
+
         # Moving averages for price analysis
         self.price_history = {}
         self.running = False
-        logger.info("Arbitrage bot initialized")
+
+        logger.info(f"Arbitrage bot initialized for {chain} chain")
+        logger.info(f"  - Available DEXes: {', '.join(self.dex_names)}")
+        logger.info(f"  - Available tokens: {', '.join(self.tokens.keys())}")
+        logger.info(f"  - CEX trading: {'enabled' if enable_cex else 'disabled'}")
 
     async def connect_binance_websocket(self):
         """Connect to Binance websocket for real-time price updates"""
@@ -148,15 +180,19 @@ class ArbitrageBot:
                 for pair in config.TRADING_PAIRS['DEX']:
                     token_in, token_out = pair.split('/')
 
-                    # Get prices from all DEXes in parallel
-                    dex_names = ['quickswap', 'sushiswap', 'uniswap_v3']
+                    # Skip if tokens not available on this chain
+                    if token_in not in self.tokens or token_out not in self.tokens:
+                        continue
+
+                    # Use DEXes available on this chain
+                    dex_names = self.dex_names
 
                     # Create all tasks at once for parallel execution
                     price_tasks = [
                         self.dex.get_token_price(
                             dex,
-                            config.TOKENS[token_in],
-                            config.TOKENS[token_out]
+                            self.tokens[token_in],
+                            self.tokens[token_out]
                         ) for dex in dex_names
                     ]
 
@@ -196,9 +232,9 @@ class ArbitrageBot:
                 await asyncio.sleep(0.01)  # 10ms instead of 100ms = 10x faster
 
             except Exception as e:
-                logger.error(f"Error in DEX arbitrage check: {str(e)}")
-                await self.monitoring.log_error({
+                logger.error(f"Error in DEX arbitrage check on {self.chain}: {str(e)}")
                     "source": "dex_arbitrage",
+                    "chain": self.chain,
                     "error": str(e)
                 })
                 await asyncio.sleep(1)
@@ -245,7 +281,7 @@ class ArbitrageBot:
 
                             # Simulate trade first to verify profitability
                             is_profitable = await self._simulate_and_verify_trade(
-                                'polygon',
+                                self.chain,
                                 dex1,
                                 dex2,
                                 token_in,
@@ -258,7 +294,7 @@ class ArbitrageBot:
                             if is_profitable:
                                 # Execute arbitrage using flashswap with retry logic
                                 await self.execute_dex_flashswap_with_retry(
-                                    'polygon',
+                                    self.chain,
                                     dex1,
                                     dex2,
                                     token_in,
@@ -275,8 +311,8 @@ class ArbitrageBot:
         """Execute arbitrage between DEXes using flashswap"""
         try:
             # Get token addresses
-            token_in_address = config.TOKENS[token_in]
-            token_out_address = config.TOKENS[token_out]
+            token_in_address = self.tokens[token_in]
+            token_out_address = self.tokens[token_out]
             
             # Get the pair address for the flashswap (depends on DEX implementation)
             pair_address = await self.dex.get_pair_address(dex1, token_in_address, token_out_address)
@@ -300,7 +336,6 @@ class ArbitrageBot:
                 logger.info(f"Successfully executed DEX flashswap arbitrage: {tx_hash}")
                 
                 # Log the trade for monitoring
-                await self.monitoring.log_trade({
                     "type": "dex_flashswap",
                     "chain": chain,
                     "token_in": token_in,
@@ -313,14 +348,12 @@ class ArbitrageBot:
                 })
                 
                 # Send alert for successful trade
-                await self.monitoring.send_alert(
                     f"DEX Flashswap: {token_in} -> {token_out} from {dex1} to {dex2}. Profit: {(prices[dex2] - prices[dex1]) * amount}",
                     "info"
                 )
             
         except Exception as e:
             logger.error(f"Error executing DEX flashswap: {str(e)}")
-            await self.monitoring.log_error({
                 "source": "dex_flashswap",
                 "error": str(e)
             })
@@ -355,7 +388,6 @@ class ArbitrageBot:
                                 logger.info(f"Successfully executed cross-chain arbitrage: {opportunity}")
                                 
                                 # Log the trade for monitoring
-                                await self.monitoring.log_trade({
                                     "type": "cross_chain",
                                     "source_chain": opportunity['source_chain'],
                                     "target_chain": opportunity['target_chain'],
@@ -366,7 +398,6 @@ class ArbitrageBot:
                                 })
                                 
                                 # Send alert for successful trade
-                                await self.monitoring.send_alert(
                                     f"Cross-Chain: {token} from {opportunity['source_chain']} to {opportunity['target_chain']}. Profit: {opportunity['profit']}",
                                     "info"
                                 )
@@ -376,7 +407,6 @@ class ArbitrageBot:
                 await asyncio.sleep(5)  # Longer delay for cross-chain checks
             except Exception as e:
                 logger.error(f"Error in cross-chain arbitrage check: {str(e)}")
-                await self.monitoring.log_error({
                     "source": "cross_chain_arbitrage",
                     "error": str(e)
                 })
@@ -444,7 +474,6 @@ class ArbitrageBot:
                 await asyncio.sleep(0.1)  # Small delay to prevent CPU overload
             except Exception as e:
                 logger.error(f"Error in CEX arbitrage check: {str(e)}")
-                await self.monitoring.log_error({
                     "source": "cex_arbitrage",
                     "error": str(e)
                 })
@@ -490,7 +519,6 @@ class ArbitrageBot:
             actual_profit = (sell_order['price'] - buy_order['price']) * amount
             
             # Log the trade for monitoring
-            await self.monitoring.log_trade({
                 "type": "cex_arbitrage",
                 "symbol": symbol,
                 "buy_exchange": buy_exchange,
@@ -502,14 +530,12 @@ class ArbitrageBot:
             })
             
             # Send alert for successful trade
-            await self.monitoring.send_alert(
                 f"CEX Arbitrage: {symbol} from {buy_exchange} to {sell_exchange}. Profit: {actual_profit}",
                 "info"
             )
             
         except Exception as e:
             logger.error(f"Error executing CEX arbitrage: {str(e)}")
-            await self.monitoring.log_error({
                 "source": "cex_arbitrage",
                 "error": str(e)
             })
@@ -545,8 +571,7 @@ class ArbitrageBot:
                 self.check_cex_arbitrage(),
                 self.check_dex_arbitrage(),
                 self.check_cross_chain_opportunities(),
-                self.withdraw_profits(),
-                self.monitoring.start_monitoring()
+                self.withdraw_profits()
             ]
             
             # Combine all tasks
@@ -563,8 +588,8 @@ class ArbitrageBot:
             w3 = self.w3
 
             # Get token addresses
-            token_in_address = config.TOKENS[token_in]
-            token_out_address = config.TOKENS[token_out]
+            token_in_address = self.tokens[token_in]
+            token_out_address = self.tokens[token_out]
 
             # Get pair address for flashswap
             pair_address = await self.dex.get_pair_address(
