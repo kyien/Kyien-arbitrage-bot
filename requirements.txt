@@ -1,13 +1,23 @@
-python-binance>=1.0.19
-ccxt>=4.0.0
-web3>=6.11.1
-python-dotenv>=1.0.0
-aiohttp>=3.9.1
-pandas>=2.1.0
-loguru>=0.7.2
-websockets>=12.0
-eth-brownie>=1.19.3
-numpy>=1.24.0
-TA-Lib>=0.4.28
-eth-account>=0.10.0
-requests>=2.31.0
+# Core blockchain libraries
+web3==6.11.3
+eth-account==0.10.0
+# eth-brownie==1.19.3
+
+# Exchange APIs
+python-binance==1.0.19
+ccxt==4.4.24
+
+# Async and networking
+aiohttp==3.9.1
+websockets==12.0
+requests==2.31.0
+
+# Data processing
+pandas==2.1.4
+numpy==1.26.2
+TA-Lib==0.4.28 --only-binary :all:
+
+
+# Utilities
+python-dotenv==1.0.0
+loguru==0.7.2

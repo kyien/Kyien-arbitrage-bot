@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 from web3 import Web3
 from loguru import logger
 
@@ -21,31 +22,32 @@ class WhitelistSetup:
     def __init__(self, chain: str):
         self.chain = chain
 
-        # Load deployment info
-        deployment_file = 'deployed_contracts_v2.json'
-        if not os.path.exists(deployment_file):
-            raise Exception(f"Deployment file not found: {deployment_file}")
+        # CRITICAL: Get absolute paths to avoid Docker mount issues
+        self.deployment_file = Path('/app/deployed_contracts_v2.json').resolve()
+        self.abi_file = Path(f'/app/deployed_contracts_v2_{chain}_abi.json').resolve()
 
-        with open(deployment_file, 'r') as f:
-            deployments = json.load(f)
-
-        if chain not in deployments:
-            raise Exception(f"No deployment found for {chain}")
-
-        self.contract_address = deployments[chain]['contract_address']
+        # Validate deployment file exists and is a file (not directory)
+        self._validate_deployment_file()
 
         # Load ABI
-        abi_file = f'deployed_contracts_v2_{chain}_abi.json'
-        if not os.path.exists(abi_file):
-            raise Exception(f"ABI file not found: {abi_file}")
-
-        with open(abi_file, 'r') as f:
-            self.contract_abi = json.load(f)
+        self.contract_abi = self._load_abi()
 
         # Initialize Web3
         chain_config = config.SUPPORTED_CHAINS.get(chain)
+        if not chain_config:
+            raise ValueError(f"Unsupported chain: {chain}")
+        
         self.w3 = Web3(Web3.HTTPProvider(chain_config['rpc']))
         self.chain_config = chain_config
+
+        # CRITICAL: Convert wallet address to checksum format
+        self.wallet_address = Web3.to_checksum_address(config.WALLET_ADDRESS)
+        self.private_key = config.PRIVATE_KEY
+
+        # Load deployment info
+        self.deployed_contracts = self._load_deployments()
+        self.contract_address = self.deployed_contracts[chain]['contract_address']
+        self.contract_address = Web3.to_checksum_address(self.contract_address)
 
         # Create contract instance
         self.contract = self.w3.eth.contract(
@@ -56,18 +58,88 @@ class WhitelistSetup:
         logger.info(f"WhitelistSetup initialized for {chain}")
         logger.info(f"Contract: {self.contract_address}")
 
+    def _validate_deployment_file(self):
+        """Ensure deployment file exists and is valid"""
+        if not self.deployment_file.exists():
+            raise FileNotFoundError(
+                f"Deployment file not found: {self.deployment_file}\n"
+                f"Run deploy_arbitrage_v2.py first!"
+            )
+        
+        # CRITICAL: Check if it's a directory (common Docker mount issue)
+        if self.deployment_file.is_dir():
+            raise IsADirectoryError(
+                f"CRITICAL ERROR: {self.deployment_file} is a directory!\n"
+                f"Remove it and create a proper JSON file."
+            )
+
+    def _load_deployments(self) -> dict:
+        """Load existing contract deployments with validation"""
+        try:
+            with open(self.deployment_file, 'r') as f:
+                content = f.read().strip()
+                if not content:
+                    logger.warning(f"{self.deployment_file} is empty")
+                    return {}
+                data = json.loads(content)
+                
+                # Validate chain data exists
+                if self.chain not in data:
+                    raise KeyError(f"No deployment found for {self.chain}")
+                
+                # Validate required fields
+                required_fields = ['contract_address', 'tx_hash', 'chain_id']
+                for field in required_fields:
+                    if field not in data[self.chain]:
+                        raise KeyError(f"Missing required field '{field}' for {self.chain}")
+                
+                return data
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in {self.deployment_file}: {str(e)}")
+            raise
+
+    def _load_abi(self) -> list:
+        """Load ABI file with validation"""
+        if not self.abi_file.exists():
+            raise FileNotFoundError(
+                f"ABI file not found: {self.abi_file}\n"
+                f"This should be created during deployment!"
+            )
+        
+        # CRITICAL: Check if it's a directory
+        if self.abi_file.is_dir():
+            raise IsADirectoryError(
+                f"CRITICAL ERROR: {self.abi_file} is a directory!\n"
+                f"Remove it and create a proper JSON file."
+            )
+        
+        try:
+            with open(self.abi_file, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in {self.abi_file}: {str(e)}")
+            raise
+
     async def whitelist_routers(self):
         """Whitelist all DEX routers for this chain"""
         logger.info(f"Whitelisting routers for {self.chain}...")
-
+        
+        # CRITICAL: Validate config exists
+        if not hasattr(config, 'DEX_ROUTERS'):
+            raise AttributeError("config.py missing DEX_ROUTERS dictionary")
+        
         routers = config.DEX_ROUTERS.get(self.chain, {})
-
         if not routers:
             logger.warning(f"No routers configured for {self.chain}")
             return
 
         for dex_name, router_address in routers.items():
-            await self._whitelist_router(dex_name, router_address)
+            # Validate router address format
+            try:
+                router_address = Web3.to_checksum_address(router_address)
+                await self._whitelist_router(dex_name, router_address)
+            except Exception as e:
+                logger.error(f"Invalid router address {router_address}: {str(e)}")
 
         logger.info(f"✓ All routers whitelisted for {self.chain}")
 
@@ -90,15 +162,15 @@ class WhitelistSetup:
                 router_address,
                 True
             ).build_transaction({
-                'from': config.WALLET_ADDRESS,
-                'nonce': self.w3.eth.get_transaction_count(config.WALLET_ADDRESS),
+                'from': self.wallet_address,  # Use checksum address
+                'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
                 'gas': 100000,
                 'gasPrice': self.w3.eth.gas_price,
                 'chainId': self.chain_config['chain_id']
             })
 
             # Sign and send
-            signed_tx = self.w3.eth.account.sign_transaction(tx, config.PRIVATE_KEY)
+            signed_tx = self.w3.eth.account.sign_transaction(tx, self.private_key)
             tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
 
             logger.info(f"  Transaction sent: {tx_hash.hex()}")
@@ -114,22 +186,36 @@ class WhitelistSetup:
                 logger.info(f"  ✓ {dex_name} whitelisted successfully")
             else:
                 logger.error(f"  ✗ Failed to whitelist {dex_name}")
+                # Log more details
+                logger.error(f"    Gas used: {receipt.gasUsed}")
+                logger.error(f"    Cumulative gas used: {receipt.cumulativeGasUsed}")
 
         except Exception as e:
             logger.error(f"Error whitelisting {dex_name}: {str(e)}")
+            # Log full traceback for debugging
+            import traceback
+            logger.error(traceback.format_exc())
 
     async def whitelist_tokens(self):
         """Whitelist all tokens for this chain"""
         logger.info(f"Whitelisting tokens for {self.chain}...")
-
+        
+        # CRITICAL: Validate config exists
+        if not hasattr(config, 'TOKENS_BY_CHAIN'):
+            raise AttributeError("config.py missing TOKENS_BY_CHAIN dictionary")
+        
         tokens = config.TOKENS_BY_CHAIN.get(self.chain, {})
-
         if not tokens:
             logger.warning(f"No tokens configured for {self.chain}")
             return
 
         for token_symbol, token_address in tokens.items():
-            await self._whitelist_token(token_symbol, token_address)
+            # Validate token address format
+            try:
+                token_address = Web3.to_checksum_address(token_address)
+                await self._whitelist_token(token_symbol, token_address)
+            except Exception as e:
+                logger.error(f"Invalid token address {token_address}: {str(e)}")
 
         logger.info(f"✓ All tokens whitelisted for {self.chain}")
 
@@ -152,15 +238,15 @@ class WhitelistSetup:
                 token_address,
                 True
             ).build_transaction({
-                'from': config.WALLET_ADDRESS,
-                'nonce': self.w3.eth.get_transaction_count(config.WALLET_ADDRESS),
+                'from': self.wallet_address,
+                'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
                 'gas': 100000,
                 'gasPrice': self.w3.eth.gas_price,
                 'chainId': self.chain_config['chain_id']
             })
 
             # Sign and send
-            signed_tx = self.w3.eth.account.sign_transaction(tx, config.PRIVATE_KEY)
+            signed_tx = self.w3.eth.account.sign_transaction(tx, self.private_key)
             tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
 
             logger.info(f"  Transaction sent: {tx_hash.hex()}")
@@ -176,12 +262,15 @@ class WhitelistSetup:
                 logger.info(f"  ✓ {token_symbol} whitelisted successfully")
             else:
                 logger.error(f"  ✗ Failed to whitelist {token_symbol}")
+                logger.error(f"    Gas used: {receipt.gasUsed}")
 
-            # Small delay between transactions
+            # Small delay between transactions to avoid rate limits
             await asyncio.sleep(2)
 
         except Exception as e:
             logger.error(f"Error whitelisting {token_symbol}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     async def verify_setup(self):
         """Verify whitelist setup"""
@@ -193,6 +282,7 @@ class WhitelistSetup:
         routers = config.DEX_ROUTERS.get(self.chain, {})
         logger.info(f"\nRouters ({len(routers)}):")
         for dex_name, router_address in routers.items():
+            router_address = Web3.to_checksum_address(router_address)
             is_whitelisted = await asyncio.to_thread(
                 self.contract.functions.whitelistedRouters(router_address).call
             )
@@ -203,6 +293,7 @@ class WhitelistSetup:
         tokens = config.TOKENS_BY_CHAIN.get(self.chain, {})
         logger.info(f"\nTokens ({len(tokens)}):")
         for token_symbol, token_address in tokens.items():
+            token_address = Web3.to_checksum_address(token_address)
             is_whitelisted = await asyncio.to_thread(
                 self.contract.functions.whitelistedTokens(token_address).call
             )
@@ -216,6 +307,14 @@ class WhitelistSetup:
         logger.info("=" * 60)
         logger.info(f"SETTING UP WHITELISTS FOR {self.chain.upper()}")
         logger.info("=" * 60)
+
+        # Pre-flight checks
+        if not self.w3.is_connected():
+            raise Exception(f"Failed to connect to {self.chain} RPC")
+
+        logger.info(f"✓ Connected to {self.chain}")
+        logger.info(f"✓ Contract: {self.contract_address}")
+        logger.info(f"✓ Wallet: {self.wallet_address}")
 
         # Whitelist routers
         await self.whitelist_routers()

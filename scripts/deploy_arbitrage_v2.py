@@ -21,7 +21,7 @@ class ArbitrageV2Deployer:
 
     def __init__(self, chain: str = 'polygon'):
         self.chain = chain
-        self.deployment_file = 'deployed_contracts_v2.json'
+        self.deployment_file = '/app/deployed_contracts_v2.json'
 
         # Get chain configuration
         chain_config = config.SUPPORTED_CHAINS.get(chain)
@@ -40,8 +40,24 @@ class ArbitrageV2Deployer:
     def _load_deployments(self) -> dict:
         """Load existing contract deployments"""
         if os.path.exists(self.deployment_file):
-            with open(self.deployment_file, 'r') as f:
-                return json.load(f)
+            if os.path.isdir(self.deployment_file):
+                logger.error(f"CRITICAL ERROR: {self.deployment_file} is a directory, not a file!")
+                logger.error("Please remove the directory and create an empty JSON file instead.")
+                sys.exit(1)
+            
+            try:
+                with open(self.deployment_file, 'r') as f:
+                    content = f.read().strip()
+                    if not content:  # File is empty
+                        logger.warning(f"{self.deployment_file} is empty, initializing with empty object")
+                        return {}
+                    return json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse {self.deployment_file}: {str(e)}")
+                logger.error("Please fix the JSON file or delete it to start fresh")
+                sys.exit(1)
+        
+        logger.info(f"{self.deployment_file} not found, starting fresh")
         return {}
 
     def _save_deployment(self, chain: str, contract_address: str, tx_hash: str):
@@ -68,22 +84,42 @@ class ArbitrageV2Deployer:
             install_solc('0.8.17')
 
             # Read contract source
-            contract_path = 'contracts/ArbitrageV2.sol'
+            contract_path = '/app/contracts/ArbitrageV2.sol'
             with open(contract_path, 'r') as file:
                 contract_source = file.read()
 
-            # Compile with dependencies
+            # Get node_modules path
+            node_modules_path = '/app/node_modules'
+            
+            logger.info(f"Node modules path: {node_modules_path}")
+            logger.info(f"OpenZeppelin exists: {os.path.exists(os.path.join(node_modules_path, '@openzeppelin'))}")
+            logger.info(f"Uniswap exists: {os.path.exists(os.path.join(node_modules_path, '@uniswap'))}")
+
+            if not os.path.exists(node_modules_path):
+                logger.error(f"CRITICAL: node_modules not found at {node_modules_path}")
+                logger.error("Directory contents of /app:")
+                logger.error(os.listdir('/app'))
+                raise FileNotFoundError("node_modules directory is missing")
+
+            # Compile with proper import remappings
             compiled_sol = compile_standard(
                 {
                     "language": "Solidity",
                     "sources": {
-                        "ArbitrageV2.sol": {"content": contract_source}
+                        "ArbitrageV2.sol": {
+                            "content": contract_source
+                        }
                     },
                     "settings": {
                         "optimizer": {
                             "enabled": True,
                             "runs": 200
                         },
+                        # CRITICAL: Remappings tell solc where to find imports
+                        "remappings": [
+                            f"@openzeppelin/={node_modules_path}/@openzeppelin/",
+                            f"@uniswap/={node_modules_path}/@uniswap/"
+                        ],
                         "outputSelection": {
                             "*": {
                                 "*": ["abi", "metadata", "evm.bytecode", "evm.bytecode.sourceMap"]
@@ -92,7 +128,7 @@ class ArbitrageV2Deployer:
                     }
                 },
                 solc_version='0.8.17',
-                allow_paths=['.']
+                allow_paths=[node_modules_path, '/app/contracts']
             )
 
             # Extract contract data

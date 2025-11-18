@@ -1,4 +1,4 @@
-version: '3.8'
+# version: '3.8'
 
 services:
   # Main arbitrage bot service
@@ -26,19 +26,15 @@ services:
 
     # Volumes for persistent data
     volumes:
-      # Logs directory (persistent)
-      - ./logs:/var/log/arbitrage-bot
-
       # Configuration files (read-only)
       - ./config.py:/app/config.py:ro
       - ./.env:/app/.env:ro
-
-      # Deployment data (persistent)
-      - ./deployed_contracts_v2.json:/app/deployed_contracts_v2.json
-      - ./deployed_contracts_v2_polygon_abi.json:/app/deployed_contracts_v2_polygon_abi.json
-      - ./deployed_contracts_v2_arbitrum_abi.json:/app/deployed_contracts_v2_arbitrum_abi.json
-      - ./deployed_contracts_v2_optimism_abi.json:/app/deployed_contracts_v2_optimism_abi.json
-      - ./deployed_contracts_v2_bsc_abi.json:/app/deployed_contracts_v2_bsc_abi.json
+      
+      # Named volume for deployment data (avoids permission issues)
+      - deployment_data:/app
+      
+      # Keep logs separate
+      - ./logs:/var/log/arbitrage-bot
 
     # Network configuration
     networks:
@@ -90,3 +86,6 @@ networks:
     # external: true
     # name: n8n_network
 
+volumes:
+  deployment_data:
+    driver: local

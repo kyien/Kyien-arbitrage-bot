@@ -1,5 +1,7 @@
 from dotenv import load_dotenv
 import os
+from web3 import Web3
+
 
 load_dotenv()
 
@@ -36,47 +38,63 @@ SUPPORTED_CHAINS = {
     'polygon': {
         'rpc': POLYGON_RPC_URL,
         'wss': POLYGON_WSS_URL,
-        'chain_id': 137
+        'chain_id': 137,
+        'native_token': 'MATIC',
+        'explorer': 'https://polygonscan.com'
     },
     'arbitrum': {
         'rpc': ARBITRUM_RPC_URL,
         'wss': ARBITRUM_WSS_URL,
-        'chain_id': 42161
+        'chain_id': 42161,
+        'native_token': 'ETH',
+        'explorer': 'https://arbiscan.io'
     },
     'optimism': {
         'rpc': OPTIMISM_RPC_URL,
         'wss': OPTIMISM_WSS_URL,
-        'chain_id': 10
+        'chain_id': 10,
+        'native_token': 'ETH',
+        'explorer': 'https://optimistic.etherscan.io'
     },
     'bsc': {
         'rpc': BSC_RPC_URL,
         'wss': BSC_WSS_URL,
-        'chain_id': 56
+        'chain_id': 56,
+        'native_token': 'BNB',
+        'explorer': 'https://bscscan.com'
     },
     'base': {
         'rpc': BASE_RPC_URL,
         'wss': BASE_WSS_URL,
-        'chain_id': 8453
+        'chain_id': 8453,
+        'native_token': 'ETH',
+        'explorer': 'https://basescan.org'
     },
     'linea': {
         'rpc': LINEA_RPC_URL,
         'wss': LINEA_WSS_URL,
-        'chain_id': 59144
+        'chain_id': 59144,
+        'native_token': 'ETH',
+        'explorer': 'https://lineascan.build'
     },
     'avalanche': {
         'rpc': AVALANCHE_RPC_URL,
         'wss': AVALANCHE_WSS_URL,
-        'chain_id': 43114
+        'chain_id': 43114,
+        'native_token': 'AVAX',
+        'explorer': 'https://snowtrace.io'
     },
     'ethereum': {
         'rpc': ETHEREUM_RPC_URL,
         'wss': ETHEREUM_WSS_URL,
-        'chain_id': 1
+        'chain_id': 1,
+        'native_token': 'ETH',
+        'explorer': 'https://etherscan.io'
     }
 }
 
 # Wallet Configuration
-WALLET_ADDRESS = os.getenv('WALLET_ADDRESS')
+WALLET_ADDRESS = Web3.to_checksum_address(os.getenv('WALLET_ADDRESS'))
 PRIVATE_KEY = os.getenv('PRIVATE_KEY')
 
 # Trading Parameters
