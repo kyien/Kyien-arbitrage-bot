@@ -22,9 +22,10 @@ class WhitelistSetup:
     def __init__(self, chain: str):
         self.chain = chain
 
-        # CRITICAL: Get absolute paths to avoid Docker mount issues
-        self.deployment_file = Path('/app/deployed_contracts_v2.json').resolve()
-        self.abi_file = Path(f'/app/deployed_contracts_v2_{chain}_abi.json').resolve()
+        # Get absolute paths from current directory to avoid Docker mount issues
+        base_dir = Path(__file__).parent.parent
+        self.deployment_file = (base_dir / 'deployed_contracts_v2.json').resolve()
+        self.abi_file = (base_dir / f'deployed_contracts_v2_{chain}_abi.json').resolve()
 
         # Validate deployment file exists and is a file (not directory)
         self._validate_deployment_file()

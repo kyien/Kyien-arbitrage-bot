@@ -459,28 +459,3 @@ contract ArbitrageExecutorV2 is Ownable, ReentrancyGuard, Pausable {
         require(success, "ETH transfer failed");
     }
 }
-
-// ============================================
-// INTERFACES
-// ============================================
-
-interface IUniswapV2Pair {
-    function token0() external view returns (address);
-    function token1() external view returns (address);
-    function factory() external view returns (address);
-    function swap(
-        uint amount0Out,
-        uint amount1Out,
-        address to,
-        bytes calldata data
-    ) external;
-    function getReserves() external view returns (
-        uint112 reserve0,
-        uint112 reserve1,
-        uint32 blockTimestampLast
-    );
-}
-
-interface IUniswapV2Factory {
-    function getPair(address tokenA, address tokenB) external view returns (address pair);
-}

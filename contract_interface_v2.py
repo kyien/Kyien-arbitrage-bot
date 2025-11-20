@@ -6,6 +6,7 @@ Interface for ArbitrageV2 contracts with enhanced security features
 import asyncio
 import json
 import os
+import time
 from web3 import Web3
 from loguru import logger
 from typing import Optional, Dict
@@ -22,6 +23,7 @@ class ContractInterfaceV2:
     - Deadline checks
     - Profitability verification
     - Whitelist management
+    - RPC error tracking and alerts
     """
 
     def __init__(self, chain: str = 'polygon'):
@@ -32,6 +34,8 @@ class ContractInterfaceV2:
             chain: Chain name (polygon, arbitrum, optimism, bsc)
         """
         self.chain = chain
+        self.rpc_error_count = 0  # Track consecutive RPC errors
+        self.last_rpc_error_time = None
 
         # Load deployment info
         deployment_file = 'deployed_contracts_v2.json'
@@ -69,10 +73,17 @@ class ContractInterfaceV2:
         self.chain_config = chain_config
 
         # Initialize Web3
-        self.w3 = Web3(Web3.HTTPProvider(chain_config['rpc']))
-
-        if not self.w3.is_connected():
-            raise Exception(f"Failed to connect to {chain} RPC")
+        try:
+            self.w3 = Web3(Web3.HTTPProvider(chain_config['rpc']))
+            if not self.w3.is_connected():
+                self._send_rpc_alert(
+                    "RPC Connection Failed",
+                    f"Failed to connect to {chain} at {chain_config['rpc']}"
+                )
+                raise Exception(f"Failed to connect to {chain} RPC")
+        except Exception as e:
+            self._send_rpc_alert("RPC Connection Error", str(e))
+            raise
 
         # Create contract instance
         self.contract = self.w3.eth.contract(
@@ -83,6 +94,123 @@ class ContractInterfaceV2:
         logger.info(f"ContractInterfaceV2 initialized for {chain}")
         logger.info(f"  Contract: {self.contract_address}")
         logger.info(f"  Chain ID: {chain_config['chain_id']}")
+        logger.info(f"  RPC URL: {chain_config['rpc']}")
+        logger.info(f"  RPC Provider: {self._get_rpc_provider(chain_config['rpc'])}")
+
+    def _get_rpc_provider(self, rpc_url: str) -> str:
+        """Detect RPC provider from URL"""
+        if 'alchemy' in rpc_url:
+            return 'Alchemy'
+        elif 'infura' in rpc_url:
+            return 'Infura'
+        elif 'quicknode' in rpc_url:
+            return 'QuickNode'
+        elif 'ankr' in rpc_url:
+            return 'Ankr'
+        elif 'mainnet' in rpc_url or 'rpc' in rpc_url:
+            return 'Public'
+        else:
+            return 'Unknown'
+
+    def _send_rpc_alert(self, error_type: str, details: str):
+        """Send RPC error alert"""
+        try:
+            # Import here to avoid circular dependency
+            from monitoring_alerts import alert_manager, AlertLevel
+            
+            # Simple alert without async
+            asyncio.create_task(
+                alert_manager.send_alert(
+                    level=AlertLevel.CRITICAL,
+                    title=f"🔗 RPC Error: {error_type}",
+                    message=f"RPC error detected on {self.chain}:\n{details}",
+                    chain=self.chain,
+                    metadata={'error_type': error_type, 'details': details}
+                )
+            )
+        except Exception as e:
+            # If alert system fails, just log
+            logger.error(f"Failed to send RPC alert: {e}")
+            logger.error(f"RPC Alert: {error_type} - {details}")
+
+    def _handle_rpc_error(self, method: str, error: Exception):
+        """Handle RPC errors and track consecutive failures"""
+        self.rpc_error_count += 1
+        self.last_rpc_error_time = time.time()
+        
+        error_msg = str(error).lower()
+        
+        # Categorize error
+        if 'timeout' in error_msg or 'timed out' in error_msg:
+            error_type = 'Timeout'
+            severity = 'warning'
+        elif 'rate limit' in error_msg or 'too many requests' in error_msg:
+            error_type = 'Rate Limit Exceeded'
+            severity = 'warning'
+        elif 'connection' in error_msg or 'cannot connect' in error_msg:
+            error_type = 'Connection Error'
+            severity = 'critical'
+        elif 'nonce too low' in error_msg:
+            error_type = 'Nonce Error'
+            severity = 'warning'
+        elif 'insufficient funds' in error_msg:
+            error_type = 'Insufficient Funds'
+            severity = 'critical'
+        elif 'revert' in error_msg or 'vm exception' in error_msg:
+            error_type = 'Contract Revert'
+            severity = 'warning'
+        elif 'invalid' in error_msg or 'bad request' in error_msg:
+            error_type = 'Invalid Request'
+            severity = 'warning'
+        else:
+            error_type = 'Unknown Error'
+            severity = 'warning'
+        
+        # Create detailed message
+        details = f"Method: {method}\n"
+        details += f"Error: {str(error)}\n"
+        details += f"Consecutive errors: {self.rpc_error_count}\n"
+        details += f"RPC Provider: {self._get_rpc_provider(self.chain_config['rpc'])}\n"
+        details += f"RPC URL: {self.chain_config['rpc']}"
+        
+        # Send alert
+        self._send_rpc_alert(error_type, details)
+        
+        # Log error
+        logger.error(f"RPC Error ({self.chain} - {error_type}): {str(error)}")
+        logger.error(f"Consecutive RPC errors: {self.rpc_error_count}")
+        
+        # Reset error count after 5 minutes of successful calls
+        if self.rpc_error_count > 10:
+            logger.critical(f"TOO MANY RPC ERRORS ({self.rpc_error_count}) - consider switching providers!")
+
+    async def _make_rpc_call(self, call_func, method_name: str = "RPC Method"):
+        """
+        Wrapper for RPC calls with error handling and alerting
+        
+        Args:
+            call_func: Async function to execute the RPC call
+            method_name: Name of the RPC method (for logging)
+            
+        Returns:
+            Result of the RPC call
+            
+        Raises:
+            Exception: RPC error with alert sent
+        """
+        try:
+            result = await call_func()
+            
+            # Reset error count on successful call
+            if self.rpc_error_count > 0:
+                logger.info(f"RPC call successful - resetting error counter (was {self.rpc_error_count})")
+                self.rpc_error_count = 0
+            
+            return result
+        except Exception as e:
+            # Handle and alert on RPC error
+            self._handle_rpc_error(method_name, e)
+            raise
 
     async def execute_flashswap(
         self,
@@ -112,7 +240,10 @@ class ContractInterfaceV2:
         try:
             # Set deadline if not provided (5 minutes from now)
             if deadline is None:
-                current_block = self.w3.eth.get_block('latest')
+                current_block = await self._make_rpc_call(
+                    lambda: asyncio.to_thread(self.w3.eth.get_block, 'latest'),
+                    "get_block"
+                )
                 deadline = current_block['timestamp'] + 300  # 5 minutes
 
             logger.info(
@@ -123,6 +254,18 @@ class ContractInterfaceV2:
                 f"  Target Router: {target_router}\n"
                 f"  Min Profit: {Web3.from_wei(min_profit, 'ether'):.6f}\n"
                 f"  Deadline: {deadline}"
+            )
+
+            # Get transaction count with error handling
+            nonce = await self._make_rpc_call(
+                lambda: asyncio.to_thread(self.w3.eth.get_transaction_count, config.WALLET_ADDRESS),
+                "get_transaction_count"
+            )
+
+            # Get gas price with error handling
+            gas_price = await self._make_rpc_call(
+                lambda: asyncio.to_thread(self.w3.eth.gas_price),
+                "gas_price"
             )
 
             # Build transaction
@@ -136,9 +279,9 @@ class ContractInterfaceV2:
                 deadline
             ).build_transaction({
                 'from': config.WALLET_ADDRESS,
-                'nonce': self.w3.eth.get_transaction_count(config.WALLET_ADDRESS),
+                'nonce': nonce,
                 'gas': 500000,  # Conservative gas limit
-                'gasPrice': self.w3.eth.gas_price,
+                'gasPrice': gas_price,
                 'chainId': self.chain_config['chain_id']
             })
 
@@ -152,17 +295,23 @@ class ContractInterfaceV2:
 
             logger.debug("Sending transaction...")
 
-            # Send transaction
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            # Send transaction with error handling
+            tx_hash = await self._make_rpc_call(
+                lambda: asyncio.to_thread(self.w3.eth.send_raw_transaction, signed_tx.rawTransaction),
+                "send_raw_transaction"
+            )
 
             logger.info(f"Transaction sent: {tx_hash.hex()}")
             logger.info("Waiting for confirmation...")
 
-            # Wait for receipt
-            receipt = await asyncio.to_thread(
-                self.w3.eth.wait_for_transaction_receipt,
-                tx_hash,
-                timeout=120
+            # Wait for receipt with error handling
+            receipt = await self._make_rpc_call(
+                lambda: asyncio.to_thread(
+                    self.w3.eth.wait_for_transaction_receipt,
+                    tx_hash,
+                    timeout=120
+                ),
+                "wait_for_transaction_receipt"
             )
 
             if receipt.status == 1:
